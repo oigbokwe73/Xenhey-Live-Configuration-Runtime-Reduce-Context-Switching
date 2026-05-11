@@ -1,6 +1,6 @@
 # Xenhey-Live-Configuration-Runtime-Reduce-Context-Switching
 
-Xenhey with Azure Cloud Backend helps teams reduce context switching by allowing API behavior, validation rules, system prompts, workflow steps, and endpoint updates to be controlled through live configuration instead of constant code changes and redeployments. This creates a faster delivery model where teams can test, validate, update, and switch between scenarios in real time using Postman.
+Xenhey leveraging Azure Cloud Beackend helps teams reduce context switching by allowing API behavior, validation rules, system prompts, workflow steps, and endpoint updates to be controlled through live configuration instead of constant code changes and redeployments. This creates a faster delivery model where teams can test, validate, update, and switch between scenarios in real time using Postman.
 
 The key value is speed and responsiveness. Developers, architects, and client facing teams can make configuration updates during a working session, immediately test the endpoint, and show results back to the client. This makes solution validation feel as simple as editing a document live, while still supporting real API behavior, AI prompt testing, business rule validation, and workflow automation.
 
