@@ -1955,3 +1955,626 @@ The `ConnectToDatabaseToSearch` workflow provides a REST-based search interface 
 
 Using a stored procedure centralizes the search rules in SQL, while the configuration-driven Xenhey workflow provides a reusable integration layer for REST clients, existing applications, reporting interfaces, and natural-language search experiences.
 
+# Natural Language Search to SQL Database
+
+## Purpose
+
+The `ConnectToDatabaseToSearch` workflow allows a user to submit a natural-language question through a REST endpoint, HTML form, or API client such as Postman. Xenhey inserts the question into a managed Liquid template, sends the completed prompt to an OpenAI model, extracts the generated SQL command, validates it, executes it against Azure SQL Database, and returns the result set as formatted JSON.
+
+Example question:
+
+```text
+Show the top 10 short-term loan applications with credit scores above 700 for homeowners with a mortgage.
+```
+
+## Important implementation distinction
+
+The inspected Xenhey template currently instructs the model to return a raw SQL `SELECT` statement against:
+
+```sql
+dbo.creditapplication
+```
+
+It does **not** currently return a stored-procedure command. Therefore, the present workflow is:
+
+```text
+Natural language → SQL SELECT statement → database execution
+```
+
+If the required architecture is:
+
+```text
+Natural language → stored-procedure parameters → stored-procedure execution
+```
+
+the Liquid template and database module should be updated accordingly. The stored-procedure approach is safer because the model selects values for approved parameters instead of generating unrestricted executable SQL.
+
+## Process overview
+
+```mermaid
+flowchart TD
+    A["Natural-language question"] --> B["Build AI request with Liquid"]
+    B --> C["Call OpenAI Chat Completions"]
+    C --> D["Extract SQL from message content"]
+    D --> E["Validate SQL guardrails"]
+    E --> F["Execute SQL command"]
+    F --> G["Return JSON result set"]
+```
+
+## Module summary
+
+| Sequence | Module                       | Enabled | Responsibility                                                                 |
+| -------: | ---------------------------- | ------: | ------------------------------------------------------------------------------ |
+|        1 | `GetAIInputData`             |     Yes | Builds the OpenAI request using a remotely managed Liquid template.            |
+|        2 | First `MakeAPICall`          |     Yes | Calls OpenAI using an authorization value stored in application configuration. |
+|        3 | Second `MakeAPICall`         |      No | Alternative API call that passes the incoming authorization header through.    |
+|        4 | `ReplaceContentTypeInHeader` |     Yes | Extracts the generated SQL from the OpenAI response’s `content` property.      |
+|        5 | `SearchDatabaseForResults`   |     Yes | Executes the generated statement and returns the result set as JSON.           |
+
+All enabled modules execute synchronously and in sequence.
+
+---
+
+## Module 1: Build the AI request
+
+```json
+{
+  "Key": "GetAIInputData",
+  "Type": "Xenhey.BPM.Core.Net8.Processes.TransformationProcess",
+  "Async": "false",
+  "IsEnable": "true",
+  "DataFlowProcessParameters": [
+    {
+      "Key": "TransformJSONPayload",
+      "Value": "yes"
+    },
+    {
+      "Key": "RemoteTemplateName",
+      "Value": "yes"
+    },
+    {
+      "Key": "remoteURL",
+      "Value": "https://www.xenhey.com/api/store/B24A3A90D5EE48BB92C61300BD518B50"
+    }
+  ]
+}
+```
+
+### Responsibility
+
+This module retrieves the remotely managed Xenhey template and applies the incoming user request to it. The output becomes the request body sent to the OpenAI API.
+
+| Setting                | Value                         | Description                                                      |
+| ---------------------- | ----------------------------- | ---------------------------------------------------------------- |
+| `TransformJSONPayload` | `yes`                         | Transforms the incoming JSON request.                            |
+| `RemoteTemplateName`   | `yes`                         | Loads the transformation template from a remote Xenhey location. |
+| `remoteURL`            | Xenhey store URL              | Location of the managed OpenAI prompt template.                  |
+| Expected input         | JSON containing `data.search` | User’s natural-language question.                                |
+| Expected output        | OpenAI request body           | Model name and system/user messages.                             |
+
+### Expected REST request
+
+Because the Liquid expression is `{{data.search}}`, the incoming payload should resemble:
+
+```json
+{
+  "data": {
+    "search": "Show the top 10 short-term applications with credit scores above 700."
+  }
+}
+```
+
+### Interpreted Xenhey template
+
+The remote URL currently generates an OpenAI request with:
+
+| Template element          | Current behavior                                                         |
+| ------------------------- | ------------------------------------------------------------------------ |
+| Model                     | `gpt-5.4`                                                                |
+| First system instruction  | Defines the model as an Azure SQL specialist and requests SQL text only. |
+| Second system instruction | Restricts the table, available columns, and selected domain values.      |
+| User message              | Receives the value from `{{data.search}}`.                               |
+| Output expectation        | A SQL `SELECT` statement without explanations or comments.               |
+
+Conceptually, the transformed request is:
+
+```json
+{
+  "model": "gpt-5.4",
+  "messages": [
+    {
+      "role": "system",
+      "content": "Translate the user request into one approved SQL SELECT statement."
+    },
+    {
+      "role": "system",
+      "content": "Use only dbo.creditapplication and the approved columns and values."
+    },
+    {
+      "role": "user",
+      "content": "Show the top 10 short-term applications with credit scores above 700."
+    }
+  ]
+}
+```
+
+The OpenAI Chat Completions API accepts a `model` and a list of conversation `messages`, which matches this template structure. [OpenAI Chat Completions API reference](https://developers.openai.com/api/reference/python/resources/chat/subresources/completions/methods/create/)
+
+### Allowed database schema in the template
+
+The prompt allows the model to use only:
+
+```sql
+dbo.creditapplication
+```
+
+Approved columns:
+
+```sql
+LoanID
+CustomerID
+CurrentLoanAmount
+CreditScore
+AnnualIncome
+Monthly_Debt
+Bankruptcies
+Years_in_current_job
+Term
+Home_Ownership
+Purpose
+```
+
+Documented values include:
+
+```text
+Term:
+- Short Term
+- Long Term
+
+Home_Ownership:
+- rent
+- Home Mortgage
+```
+
+### Example generated SQL
+
+```sql
+SELECT TOP (10)
+    LoanID,
+    CustomerID,
+    CurrentLoanAmount,
+    CreditScore,
+    AnnualIncome,
+    Monthly_Debt,
+    Bankruptcies,
+    Years_in_current_job,
+    Term,
+    Home_Ownership,
+    Purpose
+FROM dbo.creditapplication
+WHERE Term = 'Short Term'
+  AND CreditScore > 700
+  AND Home_Ownership = 'Home Mortgage'
+ORDER BY CreditScore DESC;
+```
+
+---
+
+## Module 2: Call the OpenAI API using configuration authorization
+
+```json
+{
+  "Key": "MakeAPICall",
+  "Type": "Xenhey.BPM.Core.Net8.Processes.RemoteApiProcess",
+  "Async": "false",
+  "IsEnable": "true",
+  "DataFlowProcessParameters": [
+    {
+      "Key": "MakeSimpleApiCall",
+      "Value": "Yes"
+    },
+    {
+      "Key": "PassValueFromConfig",
+      "Value": "Yes"
+    },
+    {
+      "Key": "ConfigValues",
+      "Value": "[{\"Key\": \"Authorization\",\"Value\": \"openai\"}]"
+    },
+    {
+      "Key": "MessageType",
+      "Value": "application/json"
+    },
+    {
+      "Key": "uri",
+      "Value": "https://api.openai.com/v1/chat/completions"
+    },
+    {
+      "Key": "MethodType",
+      "Value": "POST"
+    }
+  ]
+}
+```
+
+### Responsibility
+
+This module sends the generated prompt to the OpenAI Chat Completions endpoint. It obtains the authorization value from the application configuration entry named `openai`.
+
+| Setting               | Value                    | Description                                                                 |
+| --------------------- | ------------------------ | --------------------------------------------------------------------------- |
+| `MakeSimpleApiCall`   | `Yes`                    | Enables a standard outbound HTTP request.                                   |
+| `PassValueFromConfig` | `Yes`                    | Reads sensitive header values from configuration.                           |
+| `ConfigValues`        | `Authorization → openai` | Maps the `openai` configuration setting to the HTTP `Authorization` header. |
+| `MessageType`         | `application/json`       | Sends the request as JSON.                                                  |
+| `uri`                 | `/v1/chat/completions`   | OpenAI Chat Completions endpoint.                                           |
+| `MethodType`          | `POST`                   | Submits the generated model request.                                        |
+| Expected input        | OpenAI request JSON      | Output from `GetAIInputData`.                                               |
+| Expected output       | Chat completion response | Response containing the generated SQL.                                      |
+
+The configuration mapping represents:
+
+```json
+[
+  {
+    "Key": "Authorization",
+    "Value": "openai"
+  }
+]
+```
+
+Conceptually:
+
+```text
+Application configuration: openai
+                 ↓
+HTTP header: Authorization
+```
+
+The resolved header must follow the required bearer-token format:
+
+```http
+Authorization: Bearer [secured API key]
+Content-Type: application/json
+```
+
+The API key should remain in secured application configuration and must not be included in the request payload, source configuration, or logs.
+
+---
+
+## Module 3: Alternative pass-through authorization
+
+```json
+{
+  "Key": "MakeAPICall",
+  "Type": "Xenhey.BPM.Core.Net8.Processes.RemoteApiProcess",
+  "Async": "false",
+  "IsEnable": "false",
+  "DataFlowProcessParameters": [
+    {
+      "Key": "MakeSimpleApiCall",
+      "Value": "Yes"
+    },
+    {
+      "Key": "PassThroughHeaders",
+      "Value": "[{\"Key\": \"Authorization\",\"Value\": \"Authorization\"}]"
+    },
+    {
+      "Key": "MessageType",
+      "Value": "application/json"
+    },
+    {
+      "Key": "uri",
+      "Value": "https://api.openai.com/v1/chat/completions"
+    },
+    {
+      "Key": "MethodType",
+      "Value": "POST"
+    }
+  ]
+}
+```
+
+### Responsibility
+
+This disabled module provides an alternative authentication approach. Instead of retrieving the OpenAI authorization value from server-side configuration, it forwards the incoming `Authorization` header to the OpenAI API.
+
+| Setting              | Value                           | Description                                                             |
+| -------------------- | ------------------------------- | ----------------------------------------------------------------------- |
+| `PassThroughHeaders` | `Authorization → Authorization` | Copies the inbound authorization header to the outbound request.        |
+| Status               | Disabled                        | The module does not currently execute.                                  |
+| Primary use          | Delegated API call              | Allows an upstream caller to provide the outbound authorization header. |
+
+The mapping represents:
+
+```json
+[
+  {
+    "Key": "Authorization",
+    "Value": "Authorization"
+  }
+]
+```
+
+For this architecture, the enabled server-side configuration approach is preferable. It prevents the OpenAI credential from being sent by or exposed to browser and Postman clients.
+
+### Duplicate module key
+
+Both API modules use:
+
+```json
+"Key": "MakeAPICall"
+```
+
+Unique keys would improve logging and troubleshooting:
+
+```json
+{
+  "Key": "CallOpenAIUsingConfiguredAuthorization"
+}
+```
+
+```json
+{
+  "Key": "CallOpenAIUsingPassThroughAuthorization"
+}
+```
+
+---
+
+## Module 4: Extract SQL from the OpenAI response
+
+```json
+{
+  "Key": "ReplaceContentTypeInHeader",
+  "Type": "Xenhey.BPM.Core.Net8.Processes.MessageBuilderProcess",
+  "Async": "false",
+  "IsEnable": "true",
+  "DataFlowProcessParameters": [
+    {
+      "Key": "BuildArrayFromComplexObject",
+      "Value": "yes"
+    },
+    {
+      "Key": "TableName",
+      "Value": "content"
+    }
+  ]
+}
+```
+
+### Responsibility
+
+This module processes the complex OpenAI response and extracts the `content` property containing the generated SQL statement.
+
+A Chat Completions response places the assistant text under:
+
+```text
+choices[0].message.content
+```
+
+The official response schema defines `choices` as an array and `message.content` as the generated message content. [OpenAI Chat Completions response schema](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/update/)
+
+Conceptual response:
+
+```json
+{
+  "id": "chatcmpl-example",
+  "object": "chat.completion",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "SELECT TOP (10) LoanID, CustomerID FROM dbo.creditapplication WHERE CreditScore > 700"
+      },
+      "finish_reason": "stop"
+    }
+  ]
+}
+```
+
+Expected extracted value:
+
+```sql
+SELECT TOP (10)
+    LoanID,
+    CustomerID
+FROM dbo.creditapplication
+WHERE CreditScore > 700;
+```
+
+| Setting                       | Value                    | Description                                           |
+| ----------------------------- | ------------------------ | ----------------------------------------------------- |
+| `BuildArrayFromComplexObject` | `yes`                    | Navigates or flattens a complex response object.      |
+| `TableName`                   | `content`                | Identifies the property containing the generated SQL. |
+| Expected input                | Chat completion response | JSON returned by OpenAI.                              |
+| Expected output               | SQL text                 | Assistant-generated SQL command.                      |
+
+The module name `ReplaceContentTypeInHeader` does not clearly describe its behavior. A more descriptive key would be:
+
+```json
+{
+  "Key": "ExtractSQLFromAIResponse"
+}
+```
+
+The extraction should select only the first assistant result:
+
+```text
+choices[0].message.content
+```
+
+It should also reject the result when:
+
+* `choices` is empty;
+* `message.content` is null;
+* `finish_reason` is `length`;
+* a refusal is returned;
+* multiple SQL statements are present;
+* the output contains Markdown fences or explanatory text.
+
+---
+
+## Required guardrail validation
+
+The current configuration does not show a deterministic SQL-validation module between AI response extraction and database execution.
+
+A system prompt is an important instruction, but it should not be treated as the only security control. The generated statement must be validated before execution.
+
+```mermaid
+flowchart TD
+    A["Extract model output"] --> B{"Single SELECT?"}
+    B -- No --> E["Reject request"]
+    B -- Yes --> C{"Approved table and columns?"}
+    C -- No --> E
+    C -- Yes --> D["Execute with read-only identity"]
+```
+
+### Recommended SQL guardrails
+
+| Guardrail             | Validation                                                                                                   |
+| --------------------- | ------------------------------------------------------------------------------------------------------------ |
+| Statement type        | Permit one `SELECT` statement only.                                                                          |
+| Table                 | Permit only `dbo.creditapplication`.                                                                         |
+| Columns               | Permit only the columns defined in the managed template.                                                     |
+| Modification commands | Reject `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `DROP`, `ALTER`, `CREATE`, and `TRUNCATE`.                     |
+| Procedure execution   | Reject `EXEC` and `EXECUTE` in the current raw-SELECT design.                                                |
+| Permission commands   | Reject `GRANT`, `REVOKE`, and `DENY`.                                                                        |
+| Multiple statements   | Reject multiple commands or statement chaining.                                                              |
+| Comments              | Reject `--` and block comments.                                                                              |
+| Cross-database access | Reject three-part and four-part object names.                                                                |
+| Result size           | Require `TOP` and enforce a configured maximum.                                                              |
+| Execution time        | Apply a short SQL command timeout.                                                                           |
+| Database identity     | Use an identity with `SELECT` permission only on an approved view or procedure.                              |
+| Logging               | Record the question, generated SQL hash, validation result, duration, and row count without logging secrets. |
+
+---
+
+## Module 5: Execute the SQL statement
+
+```json
+{
+  "Key": "SearchDatabaseForResults",
+  "Type": "Xenhey.BPM.Core.Net8.Processes.ConnectToDBProcess",
+  "Async": "false",
+  "IsEnable": "true",
+  "DataFlowProcessParameters": [
+    {
+      "Key": "ConnectToDatabaseWithStatement",
+      "Value": "Yes"
+    },
+    {
+      "Key": "connectionstring",
+      "Value": "DatabaseConnection"
+    },
+    {
+      "Key": "messageformat",
+      "Value": "application/json"
+    }
+  ]
+}
+```
+
+### Responsibility
+
+This module connects to Azure SQL Database, executes the validated SQL statement, and converts the returned result set into JSON.
+
+| Setting                          | Value                | Description                                                              |
+| -------------------------------- | -------------------- | ------------------------------------------------------------------------ |
+| `ConnectToDatabaseWithStatement` | `Yes`                | Executes the SQL statement contained in the current process payload.     |
+| `connectionstring`               | `DatabaseConnection` | Application-setting name containing the database connection information. |
+| `messageformat`                  | `application/json`   | Serializes the SQL result set as JSON.                                   |
+| Expected input                   | Validated SQL text   | Statement extracted from the AI response.                                |
+| Expected output                  | JSON result set      | Matching credit-application records.                                     |
+
+Example response:
+
+```json
+[
+  {
+    "LoanID": "LN-1001",
+    "CustomerID": "CU-501",
+    "CurrentLoanAmount": 25000.00,
+    "CreditScore": 748,
+    "AnnualIncome": 95000.00,
+    "Monthly_Debt": 1850.00,
+    "Bankruptcies": 0,
+    "Years_in_current_job": 8,
+    "Term": "Short Term",
+    "Home_Ownership": "Home Mortgage",
+    "Purpose": "Debt Consolidation"
+  }
+]
+```
+
+SQL `NULL` values should remain JSON nulls:
+
+```json
+{
+  "AnnualIncome": null,
+  "Bankruptcies": null
+}
+```
+
+## Stored-procedure design recommended for the stated goal
+
+To meet the stated goal of returning a structured stored-procedure command, the LLM should produce a constrained data object rather than executable SQL.
+
+### Recommended AI output
+
+```json
+{
+  "procedure": "dbo.usp_SearchCreditApplications",
+  "parameters": {
+    "Term": "Short Term",
+    "MinCreditScore": 700,
+    "MaxCreditScore": null,
+    "HomeOwnership": "Home Mortgage",
+    "Purpose": null,
+    "TopN": 10
+  }
+}
+```
+
+Xenhey can then map the key-value pairs to approved stored-procedure parameters:
+
+| JSON key         | Stored-procedure parameter |
+| ---------------- | -------------------------- |
+| `Term`           | `@Term`                    |
+| `MinCreditScore` | `@MinCreditScore`          |
+| `MaxCreditScore` | `@MaxCreditScore`          |
+| `HomeOwnership`  | `@HomeOwnership`           |
+| `Purpose`        | `@Purpose`                 |
+| `TopN`           | `@TopN`                    |
+
+Conceptual database command:
+
+```sql
+EXEC dbo.usp_SearchCreditApplications
+    @Term = @TermValue,
+    @MinCreditScore = @MinCreditScoreValue,
+    @MaxCreditScore = @MaxCreditScoreValue,
+    @HomeOwnership = @HomeOwnershipValue,
+    @Purpose = @PurposeValue,
+    @TopN = @TopNValue;
+```
+
+The application should create typed SQL parameters rather than inserting the values directly into the command text.
+
+OpenAI supports Structured Outputs using a supplied JSON Schema, which would make this key-value contract more reliable than requesting free-form SQL text. [OpenAI Structured Outputs documentation](https://developers.openai.com/api/docs/guides/structured-outputs)
+
+## Conversation-context observation
+
+The remote template says to maintain conversation context, but its current `messages` array contains only:
+
+* two system messages; and
+* the current user question.
+
+No earlier user or assistant messages are supplied. Therefore, the present configuration is effectively stateless. Chat Completions requires the application to manage and resend relevant conversation history. OpenAI recommends the Responses API for new projects and provides additional options for carrying state across turns. [OpenAI migration guidance](https://developers.openai.com/api/docs/guides/migrate-to-responses)
+
+## solution summary
+
+The `ConnectToDatabaseToSearch` workflow enables natural-language search over Azure SQL data. A user submits a question through a REST interface, and Xenhey applies the question to a remotely managed Liquid template containing the model configuration, database schema, allowed fields, and SQL-generation instructions. The completed request is sent to the OpenAI API, which translates the question into a structured database search command.
+
+Xenhey extracts the generated command from the model response, validates it against approved SQL guardrails, and sends the validated command to Azure SQL Database. The matching records are then returned to the requesting application as formatted JSON. For production implementation, the safest design is for the model to return an approved stored-procedure name and structured key-value parameters rather than unrestricted SQL text.
