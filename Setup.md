@@ -1461,7 +1461,7 @@ The message should only be completed after every entity batch has been written s
 }
 ```
 
-## Reworded solution summary
+## Solution summary
 
 The `NoSQLTrigger` workflow acts as a consumer for an Azure Service Bus topic subscription. When a message satisfies the subscription’s consumer filter, Xenhey reads the message body as CSV data and converts each row into a structured JSON entity. The records are then organized into batches of up to 100 and written to the `training20260128` Azure Storage table.
 
