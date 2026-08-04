@@ -452,3 +452,430 @@ A clearer naming pattern for the final modules would be:
   "Type": "Xenhey.BPM.Core.Net8.Processes.CSVProcess"
 }
 ```
+# FileParser
+
+`FileParser` is a configuration-driven Xenhey workflow designed to process large CSV files delivered through SFTP to a shared Azure Storage location.
+
+A scheduled CRON job initiates the workflow. The modules then execute sequentially to:
+
+1. Extract the file information from the scheduler request.
+2. add the filename to the message headers.
+3. retrieve the large file from Azure Blob Storage.
+4. convert the retrieved content into a stream.
+5. split the file into manageable CSV batches.
+6. write the batch files to an Azure Storage container for downstream processing.
+
+This pattern is useful for large-file migrations, bulk data ingestion, ETL workloads, and integrations where processing an entire file in one transaction could cause memory, timeout, or performance problems.
+
+## Process overview
+
+```mermaid
+flowchart TD
+    A["CRON job starts FileParser"] --> B["Transform scheduler request"]
+    B --> C["Add filename to header"]
+    C --> D["Read file from pickup container"]
+    D --> E["Convert content to stream"]
+    E --> F["Split CSV into batches"]
+    F --> G["Write batches to processed container"]
+```
+
+## Process-level configuration
+
+```json
+{
+  "Id": "FileParser",
+  "LineOfBusinessProcessData": [
+    {
+      "Key": "object",
+      "Type": "Xenhey.BPM.Core.Net8.Processes.ProcessData"
+    }
+  ],
+  "Type": "",
+  "DataFlowProcess": []
+}
+```
+
+| Property                    | Value                                        | Description                                                                                      |
+| --------------------------- | -------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| `Id`                        | `FileParser`                                 | Unique name used to identify and invoke the workflow.                                            |
+| `LineOfBusinessProcessData` | `object`                                     | Defines the shared process-data object passed between modules.                                   |
+| `ProcessData`               | `Xenhey.BPM.Core.Net8.Processes.ProcessData` | Xenhey object that carries the payload, headers, filename, file content, and processing results. |
+| `Type`                      | Empty                                        | The workflow is driven by the modules in `DataFlowProcess`.                                      |
+| `DataFlowProcess`           | Array                                        | Ordered list of modules executed by the workflow.                                                |
+
+## Module summary
+
+| Sequence | Module                             | Type                    | Purpose                                                                   |
+| -------: | ---------------------------------- | ----------------------- | ------------------------------------------------------------------------- |
+|        1 | `TransFerDataToInformation`        | `TransformationProcess` | Transforms the CRON request into the required file-processing request.    |
+|        2 | `AddPayloadToHeader`               | `HeaderInfoProcess`     | Copies the filename from the payload into the `FileName` header.          |
+|        3 | `BlobStorageProcess`               | `BlobStorageProcess`    | Retrieves the source file from the `pickup` container.                    |
+|        4 | `ConvertStringToStream`            | `MessageBuilderProcess` | Converts the retrieved file content into a stream.                        |
+|        5 | `CreateCSVBatchFilesForProcessing` | `CSVProcess`            | Splits the CSV into batches and writes them to the `processed` container. |
+
+All five modules are enabled and run synchronously in the order shown.
+
+---
+
+## Module 1: Transform file information
+
+```json
+{
+  "Key": "TransFerDataToInformation",
+  "Type": "Xenhey.BPM.Core.Net8.Processes.TransformationProcess",
+  "Async": "false",
+  "IsEnable": "true",
+  "DataFlowProcessParameters": [
+    {
+      "Key": "TransformJSONPayload",
+      "Value": "yes"
+    },
+    {
+      "Key": "RemoteTemplateName",
+      "Value": "yes"
+    },
+    {
+      "Key": "remoteURL",
+      "Value": "https://www.xenhey.com/api/store/5E382B920AA64C11996B88785FE922D3"
+    }
+  ]
+}
+```
+
+### Responsibility
+
+This module transforms the request supplied by the CRON job into the JSON structure required by the remaining FileParser modules.
+
+The transformation template is retrieved from a Xenhey remote configuration endpoint. This allows the transformation rules to be changed without rebuilding or redeploying the application.
+
+| Setting                | Value                   | Description                                                          |
+| ---------------------- | ----------------------- | -------------------------------------------------------------------- |
+| `Type`                 | `TransformationProcess` | Executes a data transformation against the current message payload.  |
+| `Async`                | `false`                 | Waits for the transformation to finish before continuing.            |
+| `IsEnable`             | `true`                  | The module is active.                                                |
+| `TransformJSONPayload` | `yes`                   | Treats the incoming payload as JSON and transforms it.               |
+| `RemoteTemplateName`   | `yes`                   | Instructs the process to retrieve its template from a remote source. |
+| `remoteURL`            | Xenhey store URL        | Location of the managed transformation template.                     |
+| Expected input         | CRON request            | Scheduler message containing source-file information.                |
+| Expected output        | Transformed JSON        | Payload containing a normalized `filename` property.                 |
+
+A conceptual transformed payload would be:
+
+```json
+{
+  "filename": "customer-data-20260804.csv"
+}
+```
+
+The actual result depends on the transformation template returned by the remote URL.
+
+### Operational consideration
+
+The remote transformation endpoint must be available when the workflow runs. A timeout, invalid response, or unavailable template should stop processing before the storage module is called.
+
+---
+
+## Module 2: Add the filename to the header
+
+```json
+{
+  "Key": "AddPayloadToHeader",
+  "Type": "Xenhey.BPM.Core.Net8.Processes.HeaderInfoProcess",
+  "Async": "false",
+  "IsEnable": "true",
+  "DataFlowProcessParameters": [
+    {
+      "Key": "AddFilteredPayloadDataToHeaders",
+      "Value": "yes"
+    },
+    {
+      "Key": "filters",
+      "Value": "[{\"Key\": \"FileName\",\"Value\": \"filename\"}]"
+    }
+  ]
+}
+```
+
+### Responsibility
+
+This module reads the `filename` property from the transformed payload and adds it to the message headers as `FileName`.
+
+The Blob Storage module then uses this header to determine which file to retrieve.
+
+| Setting                           | Value                 | Description                                                 |
+| --------------------------------- | --------------------- | ----------------------------------------------------------- |
+| `Type`                            | `HeaderInfoProcess`   | Manages message-header information.                         |
+| `Async`                           | `false`               | Completes the header update before the storage module runs. |
+| `IsEnable`                        | `true`                | The module is active.                                       |
+| `AddFilteredPayloadDataToHeaders` | `yes`                 | Copies selected payload properties into message headers.    |
+| `filters`                         | `FileName → filename` | Maps payload property `filename` to header `FileName`.      |
+| Expected input                    | JSON payload          | Payload containing `filename`.                              |
+| Expected output                   | Updated headers       | Message containing the `FileName` header.                   |
+
+The escaped `filters` setting represents:
+
+```json
+[
+  {
+    "Key": "FileName",
+    "Value": "filename"
+  }
+]
+```
+
+Conceptual input:
+
+```json
+{
+  "filename": "customer-data-20260804.csv"
+}
+```
+
+Resulting message header:
+
+```json
+{
+  "FileName": "customer-data-20260804.csv"
+}
+```
+
+The property names are case-sensitive unless Xenhey performs case-insensitive matching. The `FileName` header must match the `headername` configured in the next module.
+
+---
+
+## Module 3: Retrieve the file from Azure Blob Storage
+
+```json
+{
+  "Key": "BlobStorageProcess",
+  "Type": "Xenhey.BPM.Core.Net8.Processes.BlobStorageProcess",
+  "Async": "false",
+  "IsEnable": "true",
+  "DataFlowProcessParameters": [
+    {
+      "Key": "ReadFileNameFromHeader",
+      "Value": "yes"
+    },
+    {
+      "Key": "StorageAccount",
+      "Value": "AzureWebJobsStorage"
+    },
+    {
+      "Key": "Container",
+      "Value": "pickup"
+    },
+    {
+      "Key": "headername",
+      "Value": "FileName"
+    }
+  ]
+}
+```
+
+### Responsibility
+
+This module retrieves the source file from the `pickup` container in Azure Blob Storage.
+
+The name of the file is read dynamically from the `FileName` message header populated by the preceding module.
+
+| Setting                  | Value                 | Description                                                                |
+| ------------------------ | --------------------- | -------------------------------------------------------------------------- |
+| `Type`                   | `BlobStorageProcess`  | Executes Azure Blob Storage operations.                                    |
+| `Async`                  | `false`               | Waits until the file has been retrieved.                                   |
+| `IsEnable`               | `true`                | The module is active.                                                      |
+| `ReadFileNameFromHeader` | `yes`                 | Reads the source filename from a message header.                           |
+| `StorageAccount`         | `AzureWebJobsStorage` | Application setting containing the Azure Storage connection configuration. |
+| `Container`              | `pickup`              | Source container holding SFTP-delivered files.                             |
+| `headername`             | `FileName`            | Name of the header containing the source filename.                         |
+| Expected input           | `FileName` header     | Name or relative path of the blob to retrieve.                             |
+| Expected output          | File content          | CSV file content passed to the next module.                                |
+
+Conceptual storage structure:
+
+```text
+Azure Storage account
+├── pickup
+│   └── customer-data-20260804.csv
+└── processed
+```
+
+### SFTP relationship
+
+When SFTP support is enabled for the Azure Storage account, an external system can upload the large CSV file into the `pickup` container or its assigned home directory.
+
+The FileParser workflow does not perform the SFTP transfer itself. It processes the file after the transfer has completed and the CRON job identifies it for processing.
+
+The CRON job should avoid selecting files that are still being uploaded. A common pattern is to upload with a temporary extension and rename the file to `.csv` after the transfer completes.
+
+---
+
+## Module 4: Convert the file content into a stream
+
+```json
+{
+  "Key": "ConvertStringToStream",
+  "Type": "Xenhey.BPM.Core.Net8.Processes.MessageBuilderProcess",
+  "Async": "false",
+  "IsEnable": "true",
+  "DataFlowProcessParameters": [
+    {
+      "Key": "ConvertStringToStream",
+      "Value": "yes"
+    }
+  ]
+}
+```
+
+### Responsibility
+
+This module converts the file content returned by `BlobStorageProcess` from a string into a stream.
+
+The CSV batching module can then read the file sequentially and create smaller output files.
+
+| Setting                 | Value                   | Description                                               |
+| ----------------------- | ----------------------- | --------------------------------------------------------- |
+| `Type`                  | `MessageBuilderProcess` | Converts or restructures the current message payload.     |
+| `Async`                 | `false`                 | Completes stream creation before batch processing begins. |
+| `IsEnable`              | `true`                  | The module is active.                                     |
+| `ConvertStringToStream` | `yes`                   | Converts the current string payload into a stream.        |
+| Expected input          | String                  | CSV file content returned by Blob Storage.                |
+| Expected output         | Stream                  | Stream containing the CSV content.                        |
+
+Conceptually:
+
+```text
+CSV string
+   ↓
+Memory or processing stream
+   ↓
+CSV batch processor
+```
+
+For extremely large files, the most scalable implementation is to stream the blob directly from Azure Storage instead of first loading the entire file into a string. That avoids holding two representations—the string and the stream—in application memory.
+
+---
+
+## Module 5: Create and store CSV batch files
+
+```json
+{
+  "Key": "CreateCSVBatchFilesForProcessing",
+  "Type": "Xenhey.BPM.Core.Net8.Processes.CSVProcess",
+  "Async": "false",
+  "IsEnable": "true",
+  "DataFlowProcessParameters": [
+    {
+      "Key": "StorageAccount",
+      "Value": "AzureWebJobsStorage"
+    },
+    {
+      "Key": "WriteCsvToStorageAsBatch",
+      "Value": "Yes"
+    },
+    {
+      "Key": "BatchSize",
+      "Value": "201"
+    },
+    {
+      "Key": "FolderName",
+      "Value": "CSVFiles"
+    },
+    {
+      "Key": "TableName",
+      "Value": "csvbatchfiles"
+    },
+    {
+      "Key": "Container",
+      "Value": "processed"
+    },
+    {
+      "Key": "FileExtension",
+      "Value": ".csv"
+    },
+    {
+      "Key": "ContentType",
+      "Value": "csv/text"
+    }
+  ]
+}
+```
+
+### Responsibility
+
+This module reads the CSV stream, divides the source data into batches of 201 records, and writes each batch as a separate CSV file in the `processed` container.
+
+Smaller files can then be processed independently by downstream Azure Functions, event-driven workflows, database loaders, or Xenhey processes.
+
+| Setting                    | Value                 | Description                                                           |
+| -------------------------- | --------------------- | --------------------------------------------------------------------- |
+| `Type`                     | `CSVProcess`          | Executes CSV parsing, batching, and storage operations.               |
+| `Async`                    | `false`               | Waits until all batch files have been created.                        |
+| `IsEnable`                 | `true`                | The module is active.                                                 |
+| `StorageAccount`           | `AzureWebJobsStorage` | Storage connection setting used for the output files.                 |
+| `WriteCsvToStorageAsBatch` | `Yes`                 | Enables splitting and writing the CSV into batch files.               |
+| `BatchSize`                | `201`                 | Configured number of records per output batch.                        |
+| `FolderName`               | `CSVFiles`            | Virtual folder created inside the destination container.              |
+| `TableName`                | `csvbatchfiles`       | Azure Table name available for batch tracking or processing metadata. |
+| `Container`                | `processed`           | Destination container for generated files.                            |
+| `FileExtension`            | `.csv`                | Extension assigned to each batch file.                                |
+| `ContentType`              | `csv/text`            | Content type assigned to generated blobs.                             |
+| Expected input             | CSV stream            | Stream produced by `ConvertStringToStream`.                           |
+| Expected output            | CSV batch files       | Multiple files containing smaller groups of source records.           |
+
+Conceptual output:
+
+```text
+processed
+└── CSVFiles
+    ├── customer-data-batch-0001.csv
+    ├── customer-data-batch-0002.csv
+    ├── customer-data-batch-0003.csv
+    └── customer-data-batch-0004.csv
+```
+
+For example, a source file containing 1,000 records with a batch size of 201 would conceptually produce:
+
+|     Batch |   Records |
+| --------: | --------: |
+|         1 |       201 |
+|         2 |       201 |
+|         3 |       201 |
+|         4 |       201 |
+|         5 |       196 |
+| **Total** | **1,000** |
+
+Whether the CSV header row is included in every output file depends on the implementation of `CSVProcess`. It should be included in each batch when every generated file must be independently processable.
+
+## End-to-end data flow
+
+| Stage | Input                  | Action                                              | Output                                  |
+| ----: | ---------------------- | --------------------------------------------------- | --------------------------------------- |
+|     1 | CRON scheduler request | Normalize request using remote transformation rules | JSON containing `filename`              |
+|     2 | Transformed JSON       | Copy `filename` to the `FileName` header            | Updated message headers                 |
+|     3 | `FileName` header      | Retrieve the corresponding blob from `pickup`       | Source CSV content                      |
+|     4 | CSV string             | Convert content into a stream                       | CSV stream                              |
+|     5 | CSV stream             | Split records into batches of 201                   | CSV batch files in `processed/CSVFiles` |
+|     6 | Batch files            | Make files available to downstream processors       | Scalable bulk-processing workflow       |
+
+## Recommended operational controls
+
+| Control              | Recommendation                                                                                  |
+| -------------------- | ----------------------------------------------------------------------------------------------- |
+| File completion      | Process only files whose SFTP upload has completed.                                             |
+| Duplicate prevention | Maintain a tracking record using filename, blob ETag, size, or checksum.                        |
+| File status          | Track states such as `Discovered`, `Processing`, `Completed`, and `Failed`.                     |
+| Error handling       | Move failed source files to an `error` container and record the failure reason.                 |
+| Archive              | Move successfully processed source files from `pickup` to an `archive` container.               |
+| Batch traceability   | Include the source filename, batch number, record count, and correlation ID in batch metadata.  |
+| Header handling      | Confirm that every batch file includes the original CSV header row.                             |
+| Encoding             | Define the supported encoding, preferably UTF-8.                                                |
+| Delimiter            | Define whether the parser accepts commas only or configurable delimiters.                       |
+| File validation      | Validate extension, size, headers, required columns, and malformed rows before batching.        |
+| Observability        | Log the source filename, total records, batch count, duration, and failure details.             |
+| Security             | Prefer managed identity and RBAC over storage account connection strings where supported.       |
+| MIME type            | Consider changing `csv/text` to the standard `text/csv`.                                        |
+| Large-file memory    | Stream directly from Blob Storage when possible instead of loading the entire file as a string. |
+
+## solution summary
+
+The Xenhey `FileParser` workflow provides a scalable approach for processing large CSV files delivered through SFTP to Azure Storage. A scheduled CRON job starts the workflow, which identifies the target file, retrieves it from the `pickup` container, converts the file content into a processable stream, and divides the data into smaller batches. The generated CSV batch files are written to the `processed/CSVFiles` location, where they can be processed independently by downstream services. This approach is especially valuable for large-file migrations and bulk data-ingestion workloads because it reduces memory pressure, limits processing time per batch, improves recoverability, and allows downstream processing to scale horizontally.
