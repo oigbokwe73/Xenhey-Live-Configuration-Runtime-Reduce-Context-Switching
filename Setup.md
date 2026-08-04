@@ -1123,3 +1123,346 @@ The message should only be completed after the SQL bulk-insert transaction commi
 The `ServiceBusTrigger` workflow acts as a consumer for an Azure Service Bus topic subscription. When an incoming message satisfies the subscription’s consumer filter, Xenhey starts the workflow and reads the message body as CSV-formatted data. The CSV records are converted into structured JSON and then inserted in bulk into the `dbo.CompanyLinks` table in Azure SQL Database.
 
 This event-driven pattern supports reliable and scalable ingestion of large datasets. Files can first be divided into manageable batches, published through Service Bus, and processed independently by one or more consumers. Service Bus provides workload buffering and retry capabilities, while SQL bulk insertion improves database performance and reduces the overhead associated with individual row inserts.
+# Read Message from Service Bus into Azure Table Storage
+
+## Purpose
+
+The `NoSQLTrigger` workflow is an event-driven Xenhey process that consumes CSV messages from an Azure Service Bus topic subscription and writes the records into Azure Table Storage.
+
+When an incoming message matches the configured Service Bus subscription filter, the consumer invokes the workflow. Xenhey converts the CSV message body into JSON records, groups the records into batches of up to 100, and writes them to the `training20260128` Azure Storage table.
+
+This pattern is useful for high-volume data ingestion, migration, operational lookup, and workloads that require a scalable NoSQL datastore without the relational structure of Azure SQL Database.
+
+## Process overview
+
+```mermaid
+flowchart TD
+    A["CSV batch from FileParser"] --> B["Service Bus topic"]
+    B --> C["Subscription filter matches"]
+    C --> D["NoSQLTrigger starts"]
+    D --> E["Convert CSV to JSON"]
+    E --> F["Create batches of 100"]
+    F --> G["Write entities to Azure Table Storage"]
+```
+
+## Process-level configuration
+
+```json
+{
+  "Id": "NoSQLTrigger",
+  "LineOfBusinessProcessData": [
+    {
+      "Key": "object",
+      "Type": "Xenhey.BPM.Core.Net8.Processes.ProcessData"
+    }
+  ],
+  "Type": "",
+  "DataFlowProcess": []
+}
+```
+
+| Property                    | Value                                        | Description                                                                  |
+| --------------------------- | -------------------------------------------- | ---------------------------------------------------------------------------- |
+| `Id`                        | `NoSQLTrigger`                               | Identifies the Xenhey workflow invoked by the Service Bus consumer.          |
+| `LineOfBusinessProcessData` | `object`                                     | Defines the shared process-data object used by the workflow modules.         |
+| `ProcessData`               | `Xenhey.BPM.Core.Net8.Processes.ProcessData` | Carries the message body, headers, converted records, and execution results. |
+| `Type`                      | Empty                                        | Processing is controlled by the modules in `DataFlowProcess`.                |
+| `DataFlowProcess`           | Array                                        | Ordered collection of modules executed for every received message.           |
+
+The Service Bus namespace, topic, subscription, filter, and trigger connection are not included in this configuration. They are expected to be defined in the Azure Function, worker service, or Xenhey hosting environment that starts the workflow.
+
+## Module summary
+
+| Sequence | Module                     | Type                       | Purpose                                                                 |
+| -------: | -------------------------- | -------------------------- | ----------------------------------------------------------------------- |
+|        1 | `ConvertCSVToJson`         | `CSVProcess`               | Converts the CSV message body into JSON entities.                       |
+|        2 | `WriteToAzureNoTableStore` | `AzureTableStorageProcess` | Writes the converted entities to Azure Table Storage in batches of 100. |
+
+Both modules are enabled and execute synchronously.
+
+---
+
+## Module 1: Convert CSV to JSON
+
+```json
+{
+  "Key": "ConvertCSVToJson",
+  "Type": "Xenhey.BPM.Core.Net8.Processes.CSVProcess",
+  "Async": "false",
+  "IsEnable": "true",
+  "DataFlowProcessParameters": [
+    {
+      "Key": "ReadCSVAsPlainText",
+      "Value": "yes"
+    },
+    {
+      "Key": "messageformat",
+      "Value": "application/json"
+    }
+  ]
+}
+```
+
+### Responsibility
+
+This module reads the Service Bus message body as plain-text CSV and converts each row into a JSON object.
+
+The converted JSON records become the input for the Azure Table Storage module.
+
+| Setting              | Value              | Description                                                     |
+| -------------------- | ------------------ | --------------------------------------------------------------- |
+| `Key`                | `ConvertCSVToJson` | Identifies the CSV conversion module.                           |
+| `Type`               | `CSVProcess`       | Uses the Xenhey CSV-processing component.                       |
+| `Async`              | `false`            | The conversion must finish before the storage module begins.    |
+| `IsEnable`           | `true`             | The module is active.                                           |
+| `ReadCSVAsPlainText` | `yes`              | Treats the Service Bus message body as CSV text.                |
+| `messageformat`      | `application/json` | Sets the converted output format to JSON.                       |
+| Expected input       | CSV text           | Service Bus message containing CSV headers and rows.            |
+| Expected output      | JSON array         | Collection of JSON objects representing Table Storage entities. |
+
+Example Service Bus message body:
+
+```csv
+CompanyId,CompanyName,WebsiteUrl,Category
+1001,Contoso,https://www.contoso.com,Technology
+1002,Fabrikam,https://www.fabrikam.com,Manufacturing
+```
+
+Conceptual conversion result:
+
+```json
+[
+  {
+    "CompanyId": "1001",
+    "CompanyName": "Contoso",
+    "WebsiteUrl": "https://www.contoso.com",
+    "Category": "Technology"
+  },
+  {
+    "CompanyId": "1002",
+    "CompanyName": "Fabrikam",
+    "WebsiteUrl": "https://www.fabrikam.com",
+    "Category": "Manufacturing"
+  }
+]
+```
+
+Before these objects can be written as Azure Table entities, they need valid `PartitionKey` and `RowKey` values.
+
+A destination-ready entity could resemble:
+
+```json
+{
+  "PartitionKey": "Technology",
+  "RowKey": "1001",
+  "CompanyId": "1001",
+  "CompanyName": "Contoso",
+  "WebsiteUrl": "https://www.contoso.com",
+  "Category": "Technology"
+}
+```
+
+---
+
+## Module 2: Write records to Azure Table Storage
+
+```json
+{
+  "Key": "WriteToAzureNoTableStore",
+  "Type": "Xenhey.BPM.Core.Net8.Processes.AzureTableStorageProcess",
+  "Async": "false",
+  "IsEnable": "true",
+  "DataFlowProcessParameters": [
+    {
+      "Key": "CreateRecordForAzureTableBatch",
+      "Value": "yes"
+    },
+    {
+      "Key": "BatchSize",
+      "Value": "100"
+    },
+    {
+      "Key": "StorageAccount",
+      "Value": "AzureWebJobsStorage"
+    },
+    {
+      "Key": "TableName",
+      "Value": "training20260128"
+    }
+  ]
+}
+```
+
+### Responsibility
+
+This module receives the converted JSON records, groups them into batches of up to 100 entities, and writes the entities into the `training20260128` Azure Storage table.
+
+| Setting                          | Value                      | Description                                                                |
+| -------------------------------- | -------------------------- | -------------------------------------------------------------------------- |
+| `Key`                            | `WriteToAzureNoTableStore` | Identifies the Azure Table Storage write operation.                        |
+| `Type`                           | `AzureTableStorageProcess` | Uses the Xenhey Azure Table Storage component.                             |
+| `Async`                          | `false`                    | Waits for the Table Storage operation to complete.                         |
+| `IsEnable`                       | `true`                     | The module is active.                                                      |
+| `CreateRecordForAzureTableBatch` | `yes`                      | Enables batch creation and writing of Table Storage entities.              |
+| `BatchSize`                      | `100`                      | Limits each configured batch to 100 entities.                              |
+| `StorageAccount`                 | `AzureWebJobsStorage`      | Application setting containing the Azure Storage connection configuration. |
+| `TableName`                      | `training20260128`         | Destination Azure Storage table.                                           |
+| Expected input                   | JSON entities              | Records produced by `ConvertCSVToJson`.                                    |
+| Expected output                  | Table entities             | Records stored in the destination table.                                   |
+
+Conceptual destination:
+
+```text
+Azure Storage account
+└── Tables
+    └── training20260128
+        ├── PartitionKey: Technology
+        │   ├── RowKey: 1001
+        │   └── RowKey: 1003
+        └── PartitionKey: Manufacturing
+            └── RowKey: 1002
+```
+
+## Azure Table Storage entity structure
+
+Every Azure Table Storage entity requires two identifying properties:
+
+| Property            | Purpose                                                 | Example                     |
+| ------------------- | ------------------------------------------------------- | --------------------------- |
+| `PartitionKey`      | Groups related entities and controls data distribution. | `Technology`                |
+| `RowKey`            | Uniquely identifies an entity within a partition.       | `1001`                      |
+| `Timestamp`         | Maintained by Azure Storage.                            | Assigned automatically      |
+| Business properties | Store the actual record data.                           | `CompanyName`, `WebsiteUrl` |
+
+The combination of `PartitionKey` and `RowKey` must be unique:
+
+```text
+Unique entity identifier = PartitionKey + RowKey
+```
+
+A complete entity could look like:
+
+```json
+{
+  "PartitionKey": "Technology",
+  "RowKey": "1001",
+  "CompanyId": "1001",
+  "CompanyName": "Contoso",
+  "WebsiteUrl": "https://www.contoso.com",
+  "Category": "Technology"
+}
+```
+
+If the CSV does not already contain `PartitionKey` and `RowKey`, a transformation module should generate them before `AzureTableStorageProcess` runs.
+
+## Batch behavior
+
+A source message containing 250 records would conceptually be divided as follows:
+
+|     Batch | Entity count |
+| --------: | -----------: |
+|         1 |          100 |
+|         2 |          100 |
+|         3 |           50 |
+| **Total** |      **250** |
+
+Azure Table Storage transactional batches have an important requirement: all entities in the same transaction must use the same `PartitionKey`.
+
+For example, this can be processed as one transactional batch:
+
+```json
+[
+  {
+    "PartitionKey": "Technology",
+    "RowKey": "1001"
+  },
+  {
+    "PartitionKey": "Technology",
+    "RowKey": "1002"
+  }
+]
+```
+
+These entities cannot be submitted in the same transactional batch if the process uses Azure Table transactions:
+
+```json
+[
+  {
+    "PartitionKey": "Technology",
+    "RowKey": "1001"
+  },
+  {
+    "PartitionKey": "Manufacturing",
+    "RowKey": "1002"
+  }
+]
+```
+
+Xenhey should therefore group records by `PartitionKey` before dividing them into batches of 100.
+
+## End-to-end execution sequence
+
+| Stage | Component                  | Action                                       | Result                                   |
+| ----: | -------------------------- | -------------------------------------------- | ---------------------------------------- |
+|     1 | FileParser or producer     | Creates a manageable CSV batch               | CSV content ready for messaging          |
+|     2 | Message producer           | Publishes CSV content to a Service Bus topic | Message becomes available                |
+|     3 | Topic subscription         | Applies its consumer filter                  | Matching message is delivered            |
+|     4 | `NoSQLTrigger`             | Starts the Xenhey workflow                   | Process object is initialized            |
+|     5 | `CSVProcess`               | Converts CSV rows into JSON                  | JSON entity collection                   |
+|     6 | `AzureTableStorageProcess` | Groups records into batches                  | Batches of up to 100 entities            |
+|     7 | Azure Table Storage        | Writes the entities                          | Records stored in `training20260128`     |
+|     8 | Service Bus consumer       | Completes the message                        | Message is removed from the subscription |
+
+## Recommended message-settlement behavior
+
+```mermaid
+flowchart TD
+    A["Receive Service Bus message"] --> B["Convert CSV to JSON"]
+    B --> C["Validate table entities"]
+    C --> D{"Valid keys?"}
+    D -- Yes --> E["Write entity batch"]
+    D -- No --> F["Dead-letter message"]
+    E --> G{"All writes succeeded?"}
+    G -- Yes --> H["Complete message"]
+    G -- No --> I["Retry or abandon"]
+```
+
+| Processing result                                   | Recommended action                                              |
+| --------------------------------------------------- | --------------------------------------------------------------- |
+| CSV conversion and all Table Storage writes succeed | Complete the Service Bus message.                               |
+| Temporary Azure Storage error                       | Abandon and retry the message.                                  |
+| Storage throttling                                  | Retry using exponential backoff.                                |
+| Missing `PartitionKey` or `RowKey`                  | Dead-letter the message with a validation reason.               |
+| Malformed CSV data                                  | Dead-letter or route to an error subscription.                  |
+| Duplicate entity                                    | Apply the configured insert, merge, or upsert policy.           |
+| Maximum delivery count reached                      | Allow Service Bus to move the message to its dead-letter queue. |
+
+The message should only be completed after every entity batch has been written successfully.
+
+## Configuration observations
+
+| Observation                                   | Impact                                                                       | Recommendation                                                         |
+| --------------------------------------------- | ---------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| `BatchSize` is `100`                          | Aligns with the maximum entity count for an Azure Table transactional batch. | Retain this limit, while also grouping by `PartitionKey`.              |
+| No `PartitionKey` mapping is shown            | The destination partition strategy cannot be confirmed.                      | Add or document how `PartitionKey` is generated.                       |
+| No `RowKey` mapping is shown                  | Records cannot be uniquely identified without a row key.                     | Generate a deterministic `RowKey` from the source business identifier. |
+| Insert behavior is not defined                | Duplicate delivery may cause conflicts or duplicate processing.              | Define whether the operation uses insert, replace, merge, or upsert.   |
+| Service Bus uses at-least-once delivery       | The same message may be processed more than once.                            | Use deterministic entity keys to make processing idempotent.           |
+| Key name is `WriteToAzureNoTableStore`        | The name does not clearly identify Azure Table Storage.                      | Consider `WriteToAzureTableStorage`.                                   |
+| Connection setting uses `AzureWebJobsStorage` | The workflow depends on an external connection configuration.                | Prefer managed identity and RBAC where supported.                      |
+| Table name includes a date                    | The workflow may be tied to a temporary or time-specific table.              | Use a stable table name unless date-based tables are intentional.      |
+
+## Recommended normalized module name
+
+```json
+{
+  "Key": "WriteToAzureTableStorage",
+  "Type": "Xenhey.BPM.Core.Net8.Processes.AzureTableStorageProcess"
+}
+```
+
+## Reworded solution summary
+
+The `NoSQLTrigger` workflow acts as a consumer for an Azure Service Bus topic subscription. When a message satisfies the subscription’s consumer filter, Xenhey reads the message body as CSV data and converts each row into a structured JSON entity. The records are then organized into batches of up to 100 and written to the `training20260128` Azure Storage table.
+
+This event-driven architecture supports scalable and resilient bulk-data ingestion. Azure Service Bus provides workload buffering, retry handling, and dead-letter capabilities, while Azure Table Storage provides a cost-effective and highly scalable NoSQL destination. Deterministic partition and row keys also allow the consumer to process repeated Service Bus deliveries without creating duplicate records.
