@@ -1466,3 +1466,492 @@ The message should only be completed after every entity batch has been written s
 The `NoSQLTrigger` workflow acts as a consumer for an Azure Service Bus topic subscription. When a message satisfies the subscription’s consumer filter, Xenhey reads the message body as CSV data and converts each row into a structured JSON entity. The records are then organized into batches of up to 100 and written to the `training20260128` Azure Storage table.
 
 This event-driven architecture supports scalable and resilient bulk-data ingestion. Azure Service Bus provides workload buffering, retry handling, and dead-letter capabilities, while Azure Table Storage provides a cost-effective and highly scalable NoSQL destination. Deterministic partition and row keys also allow the consumer to process repeated Service Bus deliveries without creating duplicate records.
+
+# SQL DB Search with Stored Procedure
+
+## Purpose
+
+The `ConnectToDatabaseToSearch` workflow provides a REST-driven search interface for Azure SQL Database. A client application, HTML form, Postman request, or another REST consumer submits search criteria as JSON. Xenhey extracts the supplied values, maps them to the parameters of `dbo.usp_GetTopCreditApplications`, executes the stored procedure, and returns the SQL result set as JSON.
+
+The workflow should validate required and optional values before database execution. Nullable database fields should be preserved as valid JSON `null` values in the response.
+
+## Process overview
+
+```mermaid
+flowchart TD
+    A["REST or form request"] --> B["Validate search criteria"]
+    B --> C["Extract request values"]
+    C --> D["Build stored procedure command"]
+    D --> E["Execute in Azure SQL"]
+    E --> F["Convert result set to JSON"]
+```
+
+## Current execution status
+
+| Module                     | Enabled | Current behavior                     |
+| -------------------------- | ------: | ------------------------------------ |
+| `MessageBuilderProcess`    |     Yes | Builds the stored procedure command. |
+| `SearchDatabaseForResults` |  **No** | Database execution is skipped.       |
+
+With the current configuration, Xenhey builds the SQL command but does not execute it. `SearchDatabaseForResults` must be enabled for the workflow to return database results.
+
+## Process-level configuration
+
+```json
+{
+  "Id": "ConnectToDatabaseToSearch",
+  "LineOfBusinessProcessData": [
+    {
+      "Key": "object",
+      "Type": "Xenhey.BPM.Core.Net8.Processes.ProcessData"
+    }
+  ],
+  "Type": "",
+  "DataFlowProcess": []
+}
+```
+
+| Property                    | Value                                        | Description                                                                                  |
+| --------------------------- | -------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `Id`                        | `ConnectToDatabaseToSearch`                  | Identifies the Xenhey database-search workflow.                                              |
+| `LineOfBusinessProcessData` | `object`                                     | Defines the shared process object passed between modules.                                    |
+| `ProcessData`               | `Xenhey.BPM.Core.Net8.Processes.ProcessData` | Carries the REST payload, generated query, database result, headers, and status information. |
+| `Type`                      | Empty                                        | Processing is controlled by the modules in `DataFlowProcess`.                                |
+| `DataFlowProcess`           | Array                                        | Ordered list of modules used to build and execute the search.                                |
+
+## Module summary
+
+| Sequence | Module                     | Type                    | Purpose                                                          |
+| -------: | -------------------------- | ----------------------- | ---------------------------------------------------------------- |
+|        1 | `MessageBuilderProcess`    | `MessageBuilderProcess` | Extracts request values and builds the stored procedure command. |
+|        2 | `SearchDatabaseForResults` | `ConnectToDBProcess`    | Executes the command and converts the SQL result set to JSON.    |
+
+---
+
+## Module 1: Build the stored procedure command
+
+```json
+{
+  "Key": "MessageBuilderProcess",
+  "Type": "Xenhey.BPM.Core.Net8.Processes.MessageBuilderProcess",
+  "Async": "false",
+  "IsEnable": "true",
+  "DataFlowProcessParameters": [
+    {
+      "Key": "QueryBuilder",
+      "Value": "yes"
+    },
+    {
+      "Key": "statement",
+      "Value": "EXEC dbo.usp_GetTopCreditApplications @Term = '@{Term}', @MinCreditScore = @{MinCreditScore}, @MaxCreditScore = @{MaxCreditScore}, @HomeOwnership = '@{HomeOwnership}', @TopN = @{Top}"
+    },
+    {
+      "Key": "filters",
+      "Value": "[{\"Key\": \"@{Term}\",\"Value\": \"Term\"},{\"Key\": \"@{MinCreditScore}\",\"Value\": \"MinCreditScore\"},{\"Key\": \"@{MaxCreditScore}\",\"Value\": \"MaxCreditScore\"},{\"Key\": \"@{HomeOwnership}\",\"Value\": \"HomeOwnership\"},{\"Key\": \"@{Top}\",\"Value\": \"Top\"}]"
+    }
+  ]
+}
+```
+
+### Responsibility
+
+This module reads the search values from the REST request and replaces the configured placeholders in the SQL statement.
+
+The generated command is expected to be stored in a process property named `query`, which the next module reads through its `SearchTerm` setting.
+
+| Setting         | Value                    | Description                                                    |
+| --------------- | ------------------------ | -------------------------------------------------------------- |
+| `Type`          | `MessageBuilderProcess`  | Builds a message or command from the incoming request.         |
+| `Async`         | `false`                  | Completes query construction before database execution.        |
+| `IsEnable`      | `true`                   | The module is active.                                          |
+| `QueryBuilder`  | `yes`                    | Enables SQL command construction.                              |
+| `statement`     | Stored procedure command | Defines the SQL command and its placeholders.                  |
+| `filters`       | Placeholder mappings     | Maps each command placeholder to an incoming request property. |
+| Expected input  | JSON request             | Search criteria submitted by a REST client.                    |
+| Expected output | `query` value            | Executable stored procedure command.                           |
+
+### Stored procedure statement
+
+```sql
+EXEC dbo.usp_GetTopCreditApplications
+    @Term = '@{Term}',
+    @MinCreditScore = @{MinCreditScore},
+    @MaxCreditScore = @{MaxCreditScore},
+    @HomeOwnership = '@{HomeOwnership}',
+    @TopN = @{Top}
+```
+
+### Filter mappings
+
+The escaped `filters` setting represents:
+
+```json
+[
+  {
+    "Key": "@{Term}",
+    "Value": "Term"
+  },
+  {
+    "Key": "@{MinCreditScore}",
+    "Value": "MinCreditScore"
+  },
+  {
+    "Key": "@{MaxCreditScore}",
+    "Value": "MaxCreditScore"
+  },
+  {
+    "Key": "@{HomeOwnership}",
+    "Value": "HomeOwnership"
+  },
+  {
+    "Key": "@{Top}",
+    "Value": "Top"
+  }
+]
+```
+
+| Placeholder         | Request property | Stored procedure parameter | Expected type |
+| ------------------- | ---------------- | -------------------------- | ------------- |
+| `@{Term}`           | `Term`           | `@Term`                    | String        |
+| `@{MinCreditScore}` | `MinCreditScore` | `@MinCreditScore`          | Integer       |
+| `@{MaxCreditScore}` | `MaxCreditScore` | `@MaxCreditScore`          | Integer       |
+| `@{HomeOwnership}`  | `HomeOwnership`  | `@HomeOwnership`           | String        |
+| `@{Top}`            | `Top`            | `@TopN`                    | Integer       |
+
+### Example REST request
+
+```json
+{
+  "Term": "Short Term",
+  "MinCreditScore": 650,
+  "MaxCreditScore": 800,
+  "HomeOwnership": "Mortgage",
+  "Top": 10
+}
+```
+
+### Conceptual generated command
+
+```sql
+EXEC dbo.usp_GetTopCreditApplications
+    @Term = 'Short Term',
+    @MinCreditScore = 650,
+    @MaxCreditScore = 800,
+    @HomeOwnership = 'Mortgage',
+    @TopN = 10;
+```
+
+## Module 2: Execute the database search
+
+```json
+{
+  "Key": "SearchDatabaseForResults",
+  "Type": "Xenhey.BPM.Core.Net8.Processes.ConnectToDBProcess",
+  "Async": "false",
+  "IsEnable": "false",
+  "DataFlowProcessParameters": [
+    {
+      "Key": "ConnectToDatabaseJSONResultSet",
+      "Value": "Yes"
+    },
+    {
+      "Key": "SearchTerm",
+      "Value": "query"
+    },
+    {
+      "Key": "connectionstring",
+      "Value": "DatabaseConnection"
+    },
+    {
+      "Key": "messageformat",
+      "Value": "application/json"
+    }
+  ]
+}
+```
+
+### Responsibility
+
+This module reads the generated command from the `query` process property, connects to Azure SQL Database, executes the stored procedure, and serializes the returned rows as JSON.
+
+| Setting                          | Value                | Description                                                                |
+| -------------------------------- | -------------------- | -------------------------------------------------------------------------- |
+| `Type`                           | `ConnectToDBProcess` | Uses the Xenhey database connectivity component.                           |
+| `Async`                          | `false`              | Waits for the SQL command and result conversion to complete.               |
+| `IsEnable`                       | `false`              | The module is currently disabled.                                          |
+| `ConnectToDatabaseJSONResultSet` | `Yes`                | Executes the database command and returns the result set as JSON.          |
+| `SearchTerm`                     | `query`              | Reads the SQL command generated by the first module.                       |
+| `connectionstring`               | `DatabaseConnection` | Application-setting name containing the database connection configuration. |
+| `messageformat`                  | `application/json`   | Formats the database response as JSON.                                     |
+| Expected input                   | SQL command          | Command stored in the `query` property.                                    |
+| Expected output                  | JSON result set      | Rows returned by `dbo.usp_GetTopCreditApplications`.                       |
+
+To execute the database search, the module would need:
+
+```json
+"IsEnable": "true"
+```
+
+## Example JSON result
+
+```json
+[
+  {
+    "LoanID": "LN-10001",
+    "CustomerID": "CU-50001",
+    "CurrentLoanAmount": 25000.00,
+    "CreditScore": 742,
+    "AnnualIncome": 95000.00,
+    "YearsInCurrentJob": 8,
+    "Term": "Short Term",
+    "HomeOwnership": "Mortgage",
+    "Purpose": "Debt Consolidation"
+  },
+  {
+    "LoanID": "LN-10002",
+    "CustomerID": "CU-50002",
+    "CurrentLoanAmount": 18000.00,
+    "CreditScore": 701,
+    "AnnualIncome": null,
+    "YearsInCurrentJob": null,
+    "Term": "Short Term",
+    "HomeOwnership": "Mortgage",
+    "Purpose": "Business"
+  }
+]
+```
+
+SQL `NULL` values should be returned as JSON `null`:
+
+```json
+{
+  "AnnualIncome": null
+}
+```
+
+They should not be returned as strings:
+
+```json
+{
+  "AnnualIncome": "null"
+}
+```
+
+## Request validation
+
+The supplied configuration performs placeholder mapping, but it does not explicitly show validation rules. Validation should occur before the SQL command is executed.
+
+| Field            | Validation                                      | Nullable? | Recommended behavior                 |
+| ---------------- | ----------------------------------------------- | --------: | ------------------------------------ |
+| `Term`           | Allow recognized loan terms only                |       Yes | Send SQL `NULL` when not supplied.   |
+| `MinCreditScore` | Integer within the supported credit-score range |       Yes | Apply no lower limit when null.      |
+| `MaxCreditScore` | Integer within the supported credit-score range |       Yes | Apply no upper limit when null.      |
+| `HomeOwnership`  | Validate against recognized values              |       Yes | Apply no ownership filter when null. |
+| `Top`            | Positive integer with a safe maximum            |        No | Apply a default such as 10 or 25.    |
+
+Additional validation rules should include:
+
+* `MinCreditScore` must not exceed `MaxCreditScore`.
+* `Top` should have a maximum value to prevent excessively large responses.
+* Blank strings should be normalized to SQL `NULL`.
+* Numeric fields should reject nonnumeric values.
+* Unsupported `Term` and `HomeOwnership` values should return a validation error.
+* Strings should be trimmed before execution.
+
+### Example validation error
+
+```json
+{
+  "success": false,
+  "status": 400,
+  "error": "InvalidSearchRequest",
+  "message": "MinCreditScore cannot be greater than MaxCreditScore.",
+  "details": {
+    "MinCreditScore": 800,
+    "MaxCreditScore": 650
+  }
+}
+```
+
+## Nullable request parameters
+
+The current statement encloses string placeholders in quotation marks:
+
+```sql
+@Term = '@{Term}',
+@HomeOwnership = '@{HomeOwnership}'
+```
+
+If a field is missing, this may produce an empty string instead of SQL `NULL`:
+
+```sql
+@Term = ''
+```
+
+A stored procedure can normalize empty strings:
+
+```sql
+SET @Term = NULLIF(LTRIM(RTRIM(@Term)), '');
+SET @HomeOwnership = NULLIF(LTRIM(RTRIM(@HomeOwnership)), '');
+```
+
+The procedure can then apply optional filters:
+
+```sql
+WHERE
+    (@Term IS NULL OR Term = @Term)
+    AND (@MinCreditScore IS NULL OR CreditScore >= @MinCreditScore)
+    AND (@MaxCreditScore IS NULL OR CreditScore <= @MaxCreditScore)
+    AND (@HomeOwnership IS NULL OR Home_Ownership = @HomeOwnership)
+```
+
+## Stored procedure command and key-value parameter mapping
+
+The stored procedure is passed to the `MessageBuilderProcess` as a SQL command through the `statement` configuration parameter. The procedure parameters are populated using the key-value mappings defined in `filters`.
+
+```json
+{
+  "Key": "statement",
+  "Value": "EXEC dbo.usp_GetTopCreditApplications @Term = '@{Term}', @MinCreditScore = @{MinCreditScore}, @MaxCreditScore = @{MaxCreditScore}, @HomeOwnership = '@{HomeOwnership}', @TopN = @{Top}"
+}
+```
+
+The `statement` value defines:
+
+* the stored procedure name;
+* the stored procedure parameters;
+* the placeholders that receive values from the request.
+
+### Key-value parameter mapping
+
+```json
+{
+  "Key": "filters",
+  "Value": "[{\"Key\":\"@{Term}\",\"Value\":\"Term\"},{\"Key\":\"@{MinCreditScore}\",\"Value\":\"MinCreditScore\"},{\"Key\":\"@{MaxCreditScore}\",\"Value\":\"MaxCreditScore\"},{\"Key\":\"@{HomeOwnership}\",\"Value\":\"HomeOwnership\"},{\"Key\":\"@{Top}\",\"Value\":\"Top\"}]"
+}
+```
+
+The unescaped mapping is:
+
+```json
+[
+  {
+    "Key": "@{Term}",
+    "Value": "Term"
+  },
+  {
+    "Key": "@{MinCreditScore}",
+    "Value": "MinCreditScore"
+  },
+  {
+    "Key": "@{MaxCreditScore}",
+    "Value": "MaxCreditScore"
+  },
+  {
+    "Key": "@{HomeOwnership}",
+    "Value": "HomeOwnership"
+  },
+  {
+    "Key": "@{Top}",
+    "Value": "Top"
+  }
+]
+```
+
+| Mapping key         | Request value    | Stored procedure parameter |
+| ------------------- | ---------------- | -------------------------- |
+| `@{Term}`           | `Term`           | `@Term`                    |
+| `@{MinCreditScore}` | `MinCreditScore` | `@MinCreditScore`          |
+| `@{MaxCreditScore}` | `MaxCreditScore` | `@MaxCreditScore`          |
+| `@{HomeOwnership}`  | `HomeOwnership`  | `@HomeOwnership`           |
+| `@{Top}`            | `Top`            | `@TopN`                    |
+
+The `Key` identifies the placeholder in the stored procedure command. The `Value` identifies the property that Xenhey reads from the incoming JSON request.
+
+### Example request
+
+```json
+{
+  "Term": "Short Term",
+  "MinCreditScore": 650,
+  "MaxCreditScore": 800,
+  "HomeOwnership": "Mortgage",
+  "Top": 10
+}
+```
+
+### Parameter replacement
+
+```text
+@{Term}             → Short Term
+@{MinCreditScore}   → 650
+@{MaxCreditScore}   → 800
+@{HomeOwnership}    → Mortgage
+@{Top}              → 10
+```
+
+Xenhey uses these values to build the command:
+
+```sql
+EXEC dbo.usp_GetTopCreditApplications
+    @Term = 'Short Term',
+    @MinCreditScore = 650,
+    @MaxCreditScore = 800,
+    @HomeOwnership = 'Mortgage',
+    @TopN = 10;
+```
+
+The completed command is stored in the shared `query` property. The database module reads that property using:
+
+```json
+{
+  "Key": "SearchTerm",
+  "Value": "query"
+}
+```
+
+The resulting flow is:
+
+```mermaid
+flowchart TD
+    A["JSON request"] --> B["Read key-value mappings"]
+    B --> C["Replace command placeholders"]
+    C --> D["Store command in query"]
+    D --> E["Execute stored procedure"]
+    E --> F["Return JSON result set"]
+```
+
+
+For production use, the same key-value mapping should ideally create typed database parameters instead of inserting values directly into SQL text. This preserves null values and protects the database from SQL injection.
+
+## End-to-end execution
+
+| Stage | Component               | Action                                   | Result                             |
+| ----: | ----------------------- | ---------------------------------------- | ---------------------------------- |
+|     1 | REST client             | Submits search criteria                  | JSON request received              |
+|     2 | API layer               | Authenticates and validates the request  | Approved search criteria           |
+|     3 | `MessageBuilderProcess` | Extracts and maps request values         | Stored procedure command           |
+|     4 | `ConnectToDBProcess`    | Opens the configured database connection | Active SQL connection              |
+|     5 | Stored procedure        | Applies optional search filters          | Matching credit applications       |
+|     6 | Database process        | Converts the result set into JSON        | JSON response                      |
+|     7 | REST endpoint           | Returns the response to the caller       | Search results or validation error |
+
+## Configuration observations
+
+| Observation                                 | Impact                                                                                | Recommendation                                     |
+| ------------------------------------------- | ------------------------------------------------------------------------------------- | -------------------------------------------------- |
+| `SearchDatabaseForResults` is disabled      | The stored procedure is not executed.                                                 | Enable it when database search is required.        |
+| Request values are interpolated into SQL    | Untrusted input could alter the command.                                              | Use parameterized stored procedure execution.      |
+| No explicit validation module is configured | Invalid values may reach the database.                                                | Add request validation before `QueryBuilder`.      |
+| Nullable inputs are not explicitly handled  | Missing strings may become empty strings and missing numbers may produce invalid SQL. | Convert missing values to SQL `NULL`.              |
+| Result null validation is not shown         | Consumers may receive inconsistent null formats.                                      | Serialize database `NULL` as JSON `null`.          |
+| `connectionstring` uses lowercase           | Parameter matching could fail if the runtime is case-sensitive.                       | Standardize on `ConnectionString`.                 |
+| `SearchTerm` points to `query`              | The first module must store its output under that exact property name.                | Confirm and document the shared property contract. |
+| `Top` has no visible maximum                | A caller could request an excessive result set.                                       | Apply a safe default and maximum.                  |
+
+## solution summary
+
+The `ConnectToDatabaseToSearch` workflow provides a REST-based search interface for credit-application data stored in Azure SQL Database. A client submits search criteria through an HTML form, Postman, or another REST consumer. Xenhey validates the request, extracts the relevant data points, maps them to the parameters of `dbo.usp_GetTopCreditApplications`, and executes the stored procedure. The resulting SQL rows are converted into a JSON response, with database nulls preserved as valid JSON `null` values.
+
+Using a stored procedure centralizes the search rules in SQL, while the configuration-driven Xenhey workflow provides a reusable integration layer for REST clients, existing applications, reporting interfaces, and natural-language search experiences.
+
