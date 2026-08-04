@@ -879,9 +879,9 @@ Whether the CSV header row is included in every output file depends on the imple
 ## solution summary
 
 The Xenhey `FileParser` workflow provides a scalable approach for processing large CSV files delivered through SFTP to Azure Storage. A scheduled CRON job starts the workflow, which identifies the target file, retrieves it from the `pickup` container, converts the file content into a processable stream, and divides the data into smaller batches. The generated CSV batch files are written to the `processed/CSVFiles` location, where they can be processed independently by downstream services. This approach is especially valuable for large-file migrations and bulk data-ingestion workloads because it reduces memory pressure, limits processing time per batch, improves recoverability, and allows downstream processing to scale horizontally.
+
 # Read Message from Service Bus into SQL
 
-## Purpose
 
 The `ServiceBusTrigger` workflow is an event-driven Xenhey process that consumes messages from an Azure Service Bus topic subscription and loads the message data into an Azure SQL Database.
 
