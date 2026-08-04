@@ -879,3 +879,247 @@ Whether the CSV header row is included in every output file depends on the imple
 ## solution summary
 
 The Xenhey `FileParser` workflow provides a scalable approach for processing large CSV files delivered through SFTP to Azure Storage. A scheduled CRON job starts the workflow, which identifies the target file, retrieves it from the `pickup` container, converts the file content into a processable stream, and divides the data into smaller batches. The generated CSV batch files are written to the `processed/CSVFiles` location, where they can be processed independently by downstream services. This approach is especially valuable for large-file migrations and bulk data-ingestion workloads because it reduces memory pressure, limits processing time per batch, improves recoverability, and allows downstream processing to scale horizontally.
+# Read Message from Service Bus into SQL
+
+## Purpose
+
+The `ServiceBusTrigger` workflow is an event-driven Xenhey process that consumes messages from an Azure Service Bus topic subscription and loads the message data into an Azure SQL Database.
+
+When a message matches the configured topic subscription or consumer filter, the Service Bus trigger invokes this workflow. The workflow converts the CSV message content into JSON and then performs a bulk insert into the `dbo.CompanyLinks` SQL table.
+
+This pattern is useful for scalable data ingestion because Service Bus decouples file-processing workloads from database loading. Each batch can be processed independently, retried when a temporary failure occurs, and moved to a dead-letter queue when it cannot be processed successfully.
+
+## Process overview
+
+```mermaid
+flowchart TD
+    A["CSV batch created by FileParser"] --> B["Service Bus topic"]
+    B --> C["Subscription filter matches"]
+    C --> D["ServiceBusTrigger starts"]
+    D --> E["Convert CSV to JSON"]
+    E --> F["Bulk insert records"]
+    F --> G["dbo.CompanyLinks"]
+```
+
+## Process-level configuration
+
+```json
+{
+  "Id": "ServiceBusTrigger",
+  "LineOfBusinessProcessData": [
+    {
+      "Key": "object",
+      "Type": "Xenhey.BPM.Core.Net8.Processes.ProcessData"
+    }
+  ],
+  "Type": "",
+  "DataFlowProcess": []
+}
+```
+
+| Property                    | Value                                        | Description                                                            |
+| --------------------------- | -------------------------------------------- | ---------------------------------------------------------------------- |
+| `Id`                        | `ServiceBusTrigger`                          | Identifies the workflow invoked by the Service Bus consumer.           |
+| `LineOfBusinessProcessData` | `object`                                     | Defines the shared process object used by the workflow modules.        |
+| `ProcessData`               | `Xenhey.BPM.Core.Net8.Processes.ProcessData` | Carries the message body, headers, metadata, and intermediate results. |
+| `Type`                      | Empty                                        | The workflow is controlled by its `DataFlowProcess` modules.           |
+| `DataFlowProcess`           | Array                                        | Ordered list of modules executed for each received message.            |
+
+The Service Bus namespace, topic, subscription, filters, connection configuration, and message-settlement behavior are not defined in this JSON. Those settings are expected to be configured by the Azure Function trigger, worker service, or Xenhey hosting environment that invokes `ServiceBusTrigger`.
+
+## Module summary
+
+| Sequence | Module                                       | Type                 | Purpose                                                     |
+| -------: | -------------------------------------------- | -------------------- | ----------------------------------------------------------- |
+|        1 | `ReadFileConvertToJsonforSQLDb`              | `CSVProcess`         | Converts the CSV message content into JSON records.         |
+|        2 | `ReceiveMessageFromServieBusWriteToAzureSQL` | `ConnectToDBProcess` | Bulk inserts the converted records into `dbo.CompanyLinks`. |
+
+Both modules are enabled and execute synchronously.
+
+---
+
+## Module 1: Convert the CSV message to JSON
+
+```json
+{
+  "Key": "ReadFileConvertToJsonforSQLDb",
+  "Type": "Xenhey.BPM.Core.Net8.Processes.CSVProcess",
+  "Async": "false",
+  "IsEnable": "true",
+  "DataFlowProcessParameters": [
+    {
+      "Key": "ReadCSVAsPlainText",
+      "Value": "yes"
+    },
+    {
+      "Key": "messageformat",
+      "Value": "application/json"
+    }
+  ]
+}
+```
+
+### Responsibility
+
+This module reads the Service Bus message body as plain-text CSV and converts each CSV row into a JSON object.
+
+The resulting JSON collection becomes the input for the SQL database module.
+
+| Setting              | Value                           | Description                                                  |
+| -------------------- | ------------------------------- | ------------------------------------------------------------ |
+| `Key`                | `ReadFileConvertToJsonforSQLDb` | Identifies the CSV conversion module.                        |
+| `Type`               | `CSVProcess`                    | Uses the Xenhey CSV-processing component.                    |
+| `Async`              | `false`                         | The conversion must finish before the SQL module begins.     |
+| `IsEnable`           | `true`                          | The module is active.                                        |
+| `ReadCSVAsPlainText` | `yes`                           | Treats the Service Bus message body as CSV text.             |
+| `messageformat`      | `application/json`              | Sets the converted output format to JSON.                    |
+| Expected input       | CSV text                        | Service Bus message body containing CSV headers and records. |
+| Expected output      | JSON array                      | Collection of objects representing CSV rows.                 |
+
+Example Service Bus message body:
+
+```csv
+CompanyId,CompanyName,WebsiteUrl,Category
+1001,Contoso,https://www.contoso.com,Technology
+1002,Fabrikam,https://www.fabrikam.com,Manufacturing
+```
+
+Conceptual converted output:
+
+```json
+[
+  {
+    "CompanyId": "1001",
+    "CompanyName": "Contoso",
+    "WebsiteUrl": "https://www.contoso.com",
+    "Category": "Technology"
+  },
+  {
+    "CompanyId": "1002",
+    "CompanyName": "Fabrikam",
+    "WebsiteUrl": "https://www.fabrikam.com",
+    "Category": "Manufacturing"
+  }
+]
+```
+
+The CSV column names should match the destination SQL table’s expected column names or the mapping rules implemented by `ConnectToDBProcess`.
+
+---
+
+## Module 2: Bulk insert records into Azure SQL
+
+```json
+{
+  "Key": "ReceiveMessageFromServieBusWriteToAzureSQL",
+  "Type": "Xenhey.BPM.Core.Net8.Processes.ConnectToDBProcess",
+  "Async": "false",
+  "IsEnable": "true",
+  "DataFlowProcessParameters": [
+    {
+      "Key": "ConnectToDatabaseBulkInsertFromCSVToDB",
+      "Value": "yes"
+    },
+    {
+      "Key": "DatabaseTableName",
+      "Value": "dbo.CompanyLinks"
+    },
+    {
+      "Key": "ConnectionString",
+      "Value": "DatabaseConnection"
+    },
+    {
+      "Key": "datatable",
+      "Value": "dbo.CompanyLinks"
+    }
+  ]
+}
+```
+
+### Responsibility
+
+This module connects to Azure SQL Database and performs a bulk insert of the converted message records into the `dbo.CompanyLinks` table.
+
+Bulk insertion is more efficient than inserting records one at a time because the database receives and processes a batch of rows in a single operation.
+
+| Setting                                  | Value                                        | Description                                                                 |
+| ---------------------------------------- | -------------------------------------------- | --------------------------------------------------------------------------- |
+| `Key`                                    | `ReceiveMessageFromServieBusWriteToAzureSQL` | Identifies the SQL-loading module.                                          |
+| `Type`                                   | `ConnectToDBProcess`                         | Uses the Xenhey database connectivity component.                            |
+| `Async`                                  | `false`                                      | The workflow waits for the database operation to complete.                  |
+| `IsEnable`                               | `true`                                       | The module is active.                                                       |
+| `ConnectToDatabaseBulkInsertFromCSVToDB` | `yes`                                        | Enables bulk insertion into the database.                                   |
+| `DatabaseTableName`                      | `dbo.CompanyLinks`                           | Fully qualified destination SQL table.                                      |
+| `ConnectionString`                       | `DatabaseConnection`                         | Application-setting name containing the database connection configuration.  |
+| `datatable`                              | `dbo.CompanyLinks`                           | Identifies the destination data-table structure used by the bulk operation. |
+| Expected input                           | Converted records                            | Records produced by the CSV module.                                         |
+| Expected output                          | Database result                              | Successful row count or database exception.                                 |
+
+Conceptual SQL destination:
+
+```sql
+CREATE TABLE dbo.CompanyLinks
+(
+    CompanyId   int            NOT NULL,
+    CompanyName nvarchar(200)  NOT NULL,
+    WebsiteUrl  nvarchar(500)  NULL,
+    Category    nvarchar(100)  NULL
+);
+```
+
+The actual SQL table definition must be used when validating the incoming CSV schema.
+
+## End-to-end execution sequence
+
+| Stage | Component              | Action                                                   | Result                                 |
+| ----: | ---------------------- | -------------------------------------------------------- | -------------------------------------- |
+|     1 | FileParser or producer | Creates a CSV data batch                                 | CSV batch available for processing     |
+|     2 | Message producer       | Publishes the batch content to a Service Bus topic       | Message becomes available              |
+|     3 | Topic subscription     | Evaluates subscription filters                           | Matching consumer receives the message |
+|     4 | `ServiceBusTrigger`    | Starts the Xenhey workflow                               | Shared process object created          |
+|     5 | `CSVProcess`           | Converts CSV text into JSON records                      | Structured record collection           |
+|     6 | `ConnectToDBProcess`   | Maps and bulk inserts the records                        | Rows written to `dbo.CompanyLinks`     |
+|     7 | Service Bus consumer   | Completes the message after the SQL transaction succeeds | Message removed from the subscription  |
+
+## Recommended message-settlement behavior
+
+```mermaid
+flowchart TD
+    A["Receive Service Bus message"] --> B["Convert and validate data"]
+    B --> C{"Valid?"}
+    C -- Yes --> D["Bulk insert into SQL"]
+    C -- No --> E["Abandon or dead-letter"]
+    D --> F{"Insert committed?"}
+    F -- Yes --> G["Complete message"]
+    F -- No --> E
+```
+
+| Result                                          | Recommended Service Bus action                                  |
+| ----------------------------------------------- | --------------------------------------------------------------- |
+| CSV conversion succeeds and SQL commit succeeds | Complete the message.                                           |
+| Temporary SQL connectivity failure              | Abandon the message so it can be retried.                       |
+| SQL throttling or transient timeout             | Retry with exponential backoff.                                 |
+| Invalid CSV headers or malformed data           | Dead-letter the message with a clear reason.                    |
+| Required SQL column missing                     | Dead-letter or route to a validation-failure queue.             |
+| Maximum delivery count reached                  | Allow Service Bus to move the message to the dead-letter queue. |
+| Duplicate message detected                      | Skip the insert safely and complete the message.                |
+
+The message should only be completed after the SQL bulk-insert transaction commits successfully. Completing it earlier could result in lost data if the SQL operation subsequently fails.
+
+## Configuration observations
+
+| Observation                                                                | Impact                                                                            | Recommendation                                                                         |
+| -------------------------------------------------------------------------- | --------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| The module key contains `ServieBus`                                        | Reduces consistency in logs and operational searches.                             | Rename it to `ReceiveMessageFromServiceBusWriteToAzureSQL` when compatibility permits. |
+| CSV is converted to JSON before an operation named `BulkInsertFromCSVToDB` | The module name suggests it might expect CSV, while its actual input may be JSON. | Confirm the input contract supported by `ConnectToDBProcess`.                          |
+| `DatabaseTableName` and `datatable` contain the same value                 | This may be required by Xenhey, but the settings appear redundant.                | Document the distinct purpose of each setting or consolidate them if supported.        |
+| No explicit column mapping is present                                      | Bulk loading may depend entirely on matching CSV and SQL column names.            | Validate headers before attempting the insert.                                         |
+| No transaction behavior is shown                                           | A partial insert could create inconsistent results.                               | Execute each message batch inside a database transaction.                              |
+| No duplicate protection is shown                                           | Service Bus provides at-least-once delivery, so a message may be processed again. | Use `MessageId`, `BatchId`, or a source-file/batch identifier as an idempotency key.   |
+| Connection setting is named `DatabaseConnection`                           | The workflow depends on external application configuration.                       | Store secrets securely or use managed identity where supported.                        |
+
+## solution summary
+
+The `ServiceBusTrigger` workflow acts as a consumer for an Azure Service Bus topic subscription. When an incoming message satisfies the subscription’s consumer filter, Xenhey starts the workflow and reads the message body as CSV-formatted data. The CSV records are converted into structured JSON and then inserted in bulk into the `dbo.CompanyLinks` table in Azure SQL Database.
+
+This event-driven pattern supports reliable and scalable ingestion of large datasets. Files can first be divided into manageable batches, published through Service Bus, and processed independently by one or more consumers. Service Bus provides workload buffering and retry capabilities, while SQL bulk insertion improves database performance and reduces the overhead associated with individual row inserts.
