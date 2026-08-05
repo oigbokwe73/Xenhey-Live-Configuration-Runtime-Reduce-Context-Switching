@@ -395,7 +395,7 @@ The important point is that the configuration can be updated without constantly 
 
 ---
 
-## Expanded Marketing Version
+## Marketing Version
 
 Xenhey gives teams a cleaner way to validate and update business workflows without the constant overhead of deployments. Whether you are testing a system prompt, validating data, changing an API response, updating workflow logic, or switching between different business scenarios, Xenhey allows those changes to happen through live configuration.
 
@@ -409,16 +409,4 @@ Instead of waiting days for small updates, clients can see progress in minutes. 
 
 ---
 
-## Suggested Website Section
 
-### Reduce Context Switching. Validate Faster. Update in Real Time.
-
-Xenhey helps teams move faster by reducing the friction between testing, validation, configuration updates, and client feedback. With live configuration files, real time endpoint creation, and Postman based testing, teams can quickly adjust system prompts, business rules, workflow steps, and API responses without going through constant deployment cycles.
-
-This means fewer interruptions, fewer deployments, and faster feedback.
-
-Whether you are validating AI prompts, testing API responses, transforming data, or switching between business scenarios, Xenhey gives you a clean and flexible way to update behavior in real time.
-
-For client facing teams, this is a major advantage. You can sit with a client, test a request, update the configuration, rerun the endpoint, and show the new result immediately. The experience is similar to editing a Word document live during a meeting, except you are updating real API behavior, validation logic, and workflow execution.
-
-Xenhey helps turn long feedback loops into real time collaboration.
